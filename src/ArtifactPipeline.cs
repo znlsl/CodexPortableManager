@@ -19,6 +19,10 @@ namespace CodexPortableManager
         private static readonly TimeSpan DefaultDownloadRecoveryWindow = TimeSpan.FromMinutes(30);
         private static readonly TimeSpan MaximumDownloadRetryDelay = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan DownloadProgressReportInterval = TimeSpan.FromMilliseconds(250);
+        private static readonly TimeSpan DownloadSpeedWarmupWindow = TimeSpan.FromSeconds(1);
+        private static readonly TimeSpan StagingFileAccessRetryInitialDelay = TimeSpan.FromMilliseconds(250);
+        private static readonly TimeSpan StagingFileAccessRetryMaximumDelay = TimeSpan.FromSeconds(5);
+        private const int MaximumStagingFileAccessRetries = 6;
         private readonly HttpClient httpClient;
         private readonly NetworkAvailabilityMonitor networkMonitor;
         private readonly Action<string> log;
@@ -204,7 +208,7 @@ namespace CodexPortableManager
                         "解包并验证官方 MSIX",
                         62,
                         "签名和身份验证通过，正在写入 staging 并同步核对 BlockMap。"));
-                    StagingBuildResult build = await StagingBuilder.ExtractAndValidateAsync(
+                    StagingBuildResult build = await ExtractStagingWithFileAccessRetryAsync(
                         verifiedPath,
                         stagingRoot,
                         cancellationToken).ConfigureAwait(false);
@@ -659,6 +663,68 @@ namespace CodexPortableManager
                     catch (OperationCanceledException) { }
                 }
             }
+        }
+
+        private async Task<StagingBuildResult> ExtractStagingWithFileAccessRetryAsync(
+            string packagePath,
+            string stagingRoot,
+            CancellationToken cancellationToken)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    return await StagingBuilder.ExtractAndValidateAsync(
+                        packagePath,
+                        stagingRoot,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (IOException exception) when (
+                    IsTransientFileSharingException(exception) &&
+                    attempt < MaximumStagingFileAccessRetries)
+                {
+                    TimeSpan delay = GetStagingFileAccessRetryDelay(attempt);
+                    string delayText = delay < TimeSpan.FromSeconds(1)
+                        ? Math.Ceiling(delay.TotalMilliseconds).ToString("F0", CultureInfo.InvariantCulture) + " 毫秒"
+                        : FormatDuration(delay);
+                    log(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "MSIX 解包暂时无法读取缓存文件（HResult=0x{0:X8}），将在 {1} 后重试第 {2} 次。",
+                        unchecked((uint)exception.HResult),
+                        delayText,
+                        attempt + 1));
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private static TimeSpan GetStagingFileAccessRetryDelay(int attempt)
+        {
+            int exponent = Math.Max(0, Math.Min(5, attempt));
+            double milliseconds = StagingFileAccessRetryInitialDelay.TotalMilliseconds * (1 << exponent);
+            return TimeSpan.FromMilliseconds(Math.Min(
+                StagingFileAccessRetryMaximumDelay.TotalMilliseconds,
+                milliseconds));
+        }
+
+        private static bool IsTransientFileSharingException(Exception exception)
+        {
+            Exception current = exception;
+            while (current != null)
+            {
+                IOException io = current as IOException;
+                if (io != null)
+                {
+                    int hresult = io.HResult;
+                    if (hresult == unchecked((int)0x80070020) ||
+                        hresult == unchecked((int)0x80070021))
+                    {
+                        return true;
+                    }
+                }
+                current = current.InnerException;
+            }
+            return false;
         }
 
         private static async Task ReportVerificationHeartbeatAsync(
@@ -1207,20 +1273,24 @@ namespace CodexPortableManager
                         {
                             lastPercent = percent;
                             lastProgressReportElapsed = elapsed;
+                            bool speedReady = elapsed >= DownloadSpeedWarmupWindow;
                             double seconds = Math.Max(0.001, elapsed.TotalSeconds);
-                            double speed = receivedThisAttempt / 1048576d / seconds;
+                            double speed = speedReady ? receivedThisAttempt / 1048576d / seconds : 0;
                             double remainingSeconds = speed > 0 && total > downloaded
                                 ? (total - downloaded) / 1048576d / speed
                                 : 0;
+                            string speedText = speedReady
+                                ? speed.ToString("F1", CultureInfo.InvariantCulture) + " MiB/s"
+                                : "测速中（MiB/s）";
                             progress.Report(new OperationProgress(
                                 "下载微软官方程序包",
                                 10 + (int)(percent * 45L / 100L),
                                 string.Format(
                                     CultureInfo.InvariantCulture,
-                                    "{0:F1} / {1:F1} MiB · {2:F1} MiB/s{3}",
+                                    "{0:F1} / {1:F1} MiB · {2}{3}",
                                     downloaded / 1048576d,
                                     total / 1048576d,
-                                    speed,
+                                    speedText,
                                     remainingSeconds > 1 ? " · 预计剩余 " + FormatDuration(TimeSpan.FromSeconds(remainingSeconds)) : string.Empty),
                                 true,
                                 percent));
